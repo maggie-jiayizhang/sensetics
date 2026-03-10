@@ -1,0 +1,234 @@
+import numpy as np
+import pandas as pd
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
+
+CHS = ["CH1", "CH2", "CH3", "CH4", "CH5"]
+
+def _mad(x):
+    med = np.median(x)
+    return np.median(np.abs(x - med)) + 1e-12
+
+def force_peak_detection(df_trim, fs, height=50, min_sep_ms=100):
+    # 1) robust baseline removal (median)
+    x = df_trim["Force_Z"].to_numpy(dtype=float)
+    x = x - np.median(x, keepdims=True)
+    x = np.maximum(0, x)
+
+    # 2) detect peaks
+    candidate_peaks, _ = find_peaks(
+        x,
+        height=height,
+        distance=int((min_sep_ms / 1000.0) * fs)
+    )
+
+    return candidate_peaks, x
+
+def poke_detection(pdf, fs, N_cap=None, discard_s=0.1, height=50,
+                   min_sep_ms=100, CHS=CHS):
+    """
+    Returns:
+      det_full: detector array aligned to the trimmed dataframe (after N_cap truncation)
+      n_discard: number of samples discarded at the start
+      pdf_trim: pdf truncated to N_cap (if provided)
+    """
+    # 1) truncate to true captured sweeps (avoid duplicated tail)
+    if N_cap is not None:
+        pdf_trim = pdf.iloc[:N_cap].copy()
+    else:
+        pdf_trim = pdf
+
+    # 2) discard initial settling period
+    n_discard = int(discard_s * fs)
+    df = pdf_trim.iloc[n_discard:].copy()
+
+    # 3) robust baseline removal per channel (median)
+    X = np.vstack([df[ch].to_numpy(dtype=float) for ch in CHS])
+    X = X - np.median(X, axis=1, keepdims=True)
+    X = np.maximum(0, X)
+
+    # 4) combine channels into one activity signal
+    #    only summing the channels but not force
+    mix = np.sum(np.abs(X), axis=0)  # exclude Force_Z
+
+    candidate_peaks, _ = find_peaks(
+        mix,
+        height=height,
+        distance=int((min_sep_ms / 1000.0) * fs)
+    )
+
+    return n_discard, df, mix, candidate_peaks
+
+def extract_poke_windows(pdf, peaks, fs, pre_ms=10.0, post_ms=10.0):
+    """
+    Returns a list of dicts, one per poke:
+      {
+        'peak_idx': int,
+        'window': DataFrame,
+        'baseline': dict per channel
+      }
+    """
+    pre = int((pre_ms / 1000.0) * fs)
+    post = int((post_ms / 1000.0) * fs)
+
+    pokes = []
+    for p in peaks:
+        a = max(0, p - pre)
+        b = min(len(pdf), p + post)
+
+        win = pdf.iloc[a:b].copy()
+
+        # baseline per channel from pre region
+        base = {}
+        for ch in CHS:
+            base[ch] = pdf[ch].iloc[max(0, p - pre):p].median()
+            win[ch] -= base[ch]
+
+        pokes.append({
+            "peak_idx": p,
+            "start_idx": a,
+            "end_idx": b,
+            "window": win,
+            "baseline": base
+        })
+
+    return pokes
+
+def plot_poke_windows(pokes, fs, ch="CH3", n=30, title=None):
+    f = plt.figure(figsize=(6,3))
+    for i in range(min(n, len(pokes))):
+        w = pokes[i]["window"][ch].to_numpy()
+        p = pokes[i]["peak_idx"]
+        t = np.arange(len(w)) / fs * 1000  # ms
+        plt.plot(t, w, alpha=0.8)
+        plt.axvline(x=(p - pokes[i]["start_idx"]) / fs * 1000, color='r', linestyle='--', alpha=0.5)
+    plt.xlabel("Time (ms)")
+    plt.ylabel("baseline-subtracted")
+
+    if (title is not None):
+        plt.title(title)
+    else:
+        plt.title(f"First {n} poke windows, channel {ch}")
+    plt.show()
+    return f
+
+CHS = ["CH1","CH2","CH3","CH4","CH5"]
+
+def robust_p2p(x, lo=1, hi=99):
+    return float(np.percentile(x, hi) - np.percentile(x, lo))
+
+def poke_features_from_window_robust(win, fs, t_ref_ms=12.0, pre_ms=3.0, post_ms=8.0):
+    i_ref = int((t_ref_ms/1000.0) * fs)
+    i0 = max(0, i_ref - int((pre_ms/1000.0)*fs))
+    i1 = min(len(win), i_ref + int((post_ms/1000.0)*fs))
+
+    feats = {}
+    pk_list = []
+
+    for ch in CHS:
+        x = win[ch].iloc[i0:i1].to_numpy(dtype=float)
+
+        pk98 = float(np.percentile(x, 98))               # robust peak
+        p2p = robust_p2p(x, lo=1, hi=99)                 # robust peak-to-peak
+        eng = float(np.mean(x*x))                        # mean energy (scale-invariant to window length)
+        pos_area = float(np.mean(np.maximum(0.0, x)))    # mean positive area
+
+        feats[f"{ch}_pk98"] = pk98
+        feats[f"{ch}_p2p99"] = p2p
+        feats[f"{ch}_eng"] = eng
+        feats[f"{ch}_posmean"] = pos_area
+
+        pk_list.append(pk98)
+
+    pk = np.array(pk_list)
+    s = float(pk.sum()) + 1e-12
+    prof = pk / s
+    for i, ch in enumerate(CHS):
+        feats[f"{ch}_pk98_norm"] = float(prof[i])
+
+    return feats
+
+def poke_features_for_session(x, pokes, fs, t_ref_ms=12.0, pre_ms=3.0, post_ms=8.0):
+    feature_list = []
+    for p in pokes:
+        feats = poke_features_from_window_robust(p["window"], fs, t_ref_ms, pre_ms, post_ms)
+        feats["location"] = x//100
+        feature_list.append(feats)
+    return pd.DataFrame(feature_list)
+
+### force channel processing
+def force_peak_detection(df_trim, fs, height=50, min_sep_ms=100):
+    # 1) robust baseline removal (median)
+    x = df_trim["Force_Z"].to_numpy(dtype=float)
+    x = x - np.median(x, keepdims=True)
+    x = np.maximum(0, x)
+
+    # 2) detect peaks
+    candidate_peaks, _ = find_peaks(
+        x,
+        height=height,
+        distance=int((min_sep_ms / 1000.0) * fs)
+    )
+
+    return candidate_peaks, x
+
+def extract_force_peak_strength(df_trim, candidate_peaks, fs,
+                                pre_ms=100, post_ms=100, quant=0.98):
+    
+    pre_samples = int((pre_ms / 1000.0) * fs)
+    post_samples = int((post_ms / 1000.0) * fs)
+
+    peak_strengths = []
+    for p in candidate_peaks:
+        start = max(0, p - pre_samples)
+        end = min(len(df_trim), p + post_samples)
+
+        # define peak as 98% percentile of force in the window
+        peak_strength = df_trim["Force_Z"].iloc[start:end].quantile(quant)
+        peak_strengths.append(peak_strength)
+
+    return np.array(peak_strengths)
+
+CHS = ["CH1","CH2","CH3","CH4","CH5"]
+def extract_sensor_peak_strength(win, fs, t_ref_ms=50.0, 
+                                 pre_ms=50.0, post_ms=100.0, 
+                                 ch_list=CHS):
+    
+    i_ref = int((t_ref_ms/1000.0) * fs)
+    i0 = max(0, i_ref - int((pre_ms/1000.0)*fs))
+    i1 = min(len(win), i_ref + int((post_ms/1000.0)*fs))
+
+    feats = {}
+    pk_list = []
+
+    for ch in ch_list:
+        x = win[ch].iloc[i0:i1].to_numpy(dtype=float)
+
+        pk98 = float(np.percentile(x, 98))               # robust peak
+        p2p = robust_p2p(x, lo=1, hi=99)                 # robust peak-to-peak
+        eng = float(np.mean(x*x))                        # mean energy (scale-invariant to window length)
+        pos_area = float(np.mean(np.maximum(0.0, x)))    # mean positive area
+
+        feats[f"{ch}_pk98"] = pk98
+        feats[f"{ch}_p2p99"] = p2p
+        feats[f"{ch}_eng"] = eng
+        feats[f"{ch}_posmean"] = pos_area
+
+        pk_list.append(pk98)
+
+    pk = np.array(pk_list)
+    s = float(pk.sum()) + 1e-12
+    prof = pk / s
+    for i, ch in enumerate(CHS):
+        feats[f"{ch}_pk98_norm"] = float(prof[i])
+
+    return feats
+
+def extract_sensor_peak_strength_session(poke_windows, fs, t_ref_ms=50.0, pre_ms=50.0, post_ms=100.0):
+    all_feats = []
+    for w in poke_windows:
+        feats = extract_sensor_peak_strength(w["window"], fs, t_ref_ms=t_ref_ms, pre_ms=pre_ms, post_ms=post_ms)
+        all_feats.append(feats)
+    
+    all_feats = pd.DataFrame(all_feats)
+    return all_feats
