@@ -94,14 +94,189 @@ def extract_poke_windows(pdf, peaks, fs, pre_ms=10.0, post_ms=10.0):
 
     return pokes
 
-def plot_poke_windows(pokes, fs, ch="CH3", n=30, title=None):
+def annotate_pokes_from_peaks(candidate_peaks, mix, fs,
+                              search_back_ms=120.0, search_fwd_ms=150.0,baseline_ms=50.0, guard_ms=20.0, frac=0.10,min_quiet_ms=3.0,
+    ):
+    """
+    Annotate detected poke peaks with onset/offset and baseline window.
+    Returns
+    -------
+    events : list of dict
+        Each dict has:
+            peak_idx, onset_idx, offset_idx,
+            baseline_start, baseline_end,
+            valid, notes
+    """
+    mix = np.asarray(mix, dtype=float)
+    n = len(mix)
+
+    # max search range for onset/offset
+    search_back = int(search_back_ms * fs / 1000.0)
+    search_fwd = int(search_fwd_ms * fs / 1000.0)
+    # baseline window length
+    baseline_n = int(baseline_ms * fs / 1000.0)
+    guard_n = int(guard_ms * fs / 1000.0)
+    quiet_n = max(1, int(min_quiet_ms * fs / 1000.0))
+
+    events = []
+
+    for p in candidate_peaks:
+        p = int(p)
+
+        left = max(0, p - search_back)
+        right = min(n, p + search_fwd)
+
+        peak_val = float(mix[p])
+        local_floor = float(np.median(mix[left:p])) if p > left else 0.0
+        # frac % * peak above local floor
+        thr = local_floor + frac * max(0.0, peak_val - local_floor)
+
+        # onset: walk backward until quiet
+        onset_idx = left
+        found_onset = False
+        for i in range(p, left + quiet_n - 1, -1):
+            seg = mix[i - quiet_n:i]
+            if len(seg) == quiet_n and np.all(seg <= thr):
+                onset_idx = i
+                found_onset = True
+                break
+
+        # offset: walk forward until quiet
+        offset_idx = right
+        found_offset = False
+        for i in range(p, right - quiet_n + 1):
+            seg = mix[i:i + quiet_n]
+            if len(seg) == quiet_n and np.all(seg <= thr):
+                offset_idx = i
+                found_offset = True
+                break
+
+        baseline_end = max(0, onset_idx - guard_n)
+        baseline_start = max(0, baseline_end - baseline_n)
+
+        notes = []
+        valid = True
+
+        if not found_onset:
+            notes.append("onset_not_found")
+            valid = False
+        if not found_offset:
+            notes.append("offset_not_found")
+        if baseline_end <= baseline_start:
+            notes.append("baseline_window_empty")
+            valid = False
+        if offset_idx <= onset_idx:
+            notes.append("offset_before_onset")
+            valid = False
+
+        events.append({
+            "peak_idx": p,
+            "onset_idx": int(onset_idx),
+            "offset_idx": int(offset_idx),
+            "baseline_start": int(baseline_start),
+            "baseline_end": int(baseline_end),
+            "valid": valid,
+            "notes": notes,
+        })
+
+    return events
+
+def extract_poke_windows_from_annotations(pdf, events, fs, 
+                                          pad_pre_ms=10.0, pad_post_ms=10.0,chs=CHS,baseline_stat="median",
+    ):
+    """
+    Extract poke windows using annotated events.
+
+    Parameters
+    ----------
+    pdf : needs to be pdf_trim (aligned with annotation)
+    pre_, post_ms: window around annotated peak (onset-offset)
+
+    Returns
+    -------
+    pokes : list of dict
+        One per poke, with fields:
+            peak_idx, onset_idx, offset_idx,
+            start_idx, end_idx,
+            baseline_start, baseline_end,
+            window, baseline, valid, notes
+    """
+    pokes = []
+    pre = int((pad_pre_ms / 1000.0) * fs)
+    post = int((pad_post_ms / 1000.0) * fs)
+
+    for e in events:
+        # peak, onset, offset from annotation
+        onset, offset = int(e["onset_idx"]), int(e["offset_idx"])
+        p = int(e["peak_idx"])
+
+        a = max(0, p - pre)
+        b = min(len(pdf), p + post)
+
+        win = pdf.iloc[a:b].copy()
+
+        # baseline per channel from annotated baseline window
+        bs = int(e["baseline_start"])
+        be = int(e["baseline_end"])
+
+        base = {}
+        for ch in chs:
+            seg = pdf[ch].iloc[bs:be]
+
+            if len(seg) == 0:
+                val = 0.0
+            elif baseline_stat == "mean":
+                val = float(seg.mean())
+            else:
+                val = float(seg.median())
+
+            base[ch] = val
+            win[ch] -= val
+
+        pokes.append({
+            "peak_idx": p,
+            "onset_idx": onset,
+            "offset_idx": offset,
+            "start_idx": a,
+            "end_idx": b,
+            "baseline_start": bs,
+            "baseline_end": be,
+            "window": win,
+            "baseline": base,
+            "valid": e.get("valid", True),
+            "notes": e.get("notes", []),
+        })
+
+    return pokes
+
+def plot_poke_windows(pokes, fs, ch="CH3", n=30, title=None,
+                      show_peak=True, show_onset_offset=True, show_baseline_window=True,):
+    
     f = plt.figure(figsize=(6,3))
+
     for i in range(min(n, len(pokes))):
-        w = pokes[i]["window"][ch].to_numpy()
-        p = pokes[i]["peak_idx"]
+        pk = pokes[i]
+        w = pk["window"][ch].to_numpy()
+        p = pk["peak_idx"]
         t = np.arange(len(w)) / fs * 1000  # ms
-        plt.plot(t, w, alpha=0.8)
-        plt.axvline(x=(p - pokes[i]["start_idx"]) / fs * 1000, color='r', linestyle='--', alpha=0.5)
+        
+        plt.plot(t, w, color="black", alpha=0.25, linewidth=1)
+
+        if show_peak and "peak_idx" in pk:
+            plt.axvline(x=(p - pk["start_idx"]) / fs * 1000, color='r', linestyle='--', alpha=0.5)
+
+        if show_onset_offset and "onset_idx" in pk and "offset_idx" in pk:
+            onset_rel = (pk["onset_idx"] - pk["start_idx"]) / fs * 1000
+            offset_rel = (pk["offset_idx"] - pk["start_idx"]) / fs * 1000
+            plt.axvline(x=onset_rel, color="0.4", linestyle=":", linewidth=1)
+            plt.axvline(x=offset_rel, color="0.4", linestyle=":", linewidth=1)
+
+        if show_baseline_window and \
+            ("baseline_start" in pk) and ("baseline_end" in pk):
+            bs_rel = (pk["baseline_start"] - pk["start_idx"]) / fs * 1000
+            be_rel = (pk["baseline_end"] - pk["start_idx"]) / fs * 1000
+            plt.axvspan(bs_rel, be_rel, color="#b0c4de", alpha=0.15)
+
     plt.xlabel("Time (ms)")
     plt.ylabel("baseline-subtracted")
 
@@ -109,6 +284,20 @@ def plot_poke_windows(pokes, fs, ch="CH3", n=30, title=None):
         plt.title(title)
     else:
         plt.title(f"First {n} poke windows, channel {ch}")
+
+    handles, labels = [], []
+    if show_peak:
+        handles.append(plt.Line2D([0], [0], color='r', linestyle='--', alpha=0.5))
+        labels.append("peak")
+    if show_onset_offset:
+        handles.append(plt.Line2D([0], [0], color='0.4', linestyle=':', alpha=0.5))
+        labels.append("onset/offset")
+    if show_baseline_window:
+        handles.append(plt.Rectangle((0,0),1,1, color="#b0c4de", alpha=0.6))
+        labels.append("baseline window")
+    if handles:
+        plt.legend(handles, labels)
+    plt.axhline(0, color="0.8", linestyle="--", linewidth=1)
     plt.show()
     return f
 
