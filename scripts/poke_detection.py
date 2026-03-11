@@ -95,7 +95,7 @@ def extract_poke_windows(pdf, peaks, fs, pre_ms=10.0, post_ms=10.0):
     return pokes
 
 def annotate_pokes_from_peaks(candidate_peaks, mix, fs,
-                              search_back_ms=120.0, search_fwd_ms=150.0,baseline_ms=50.0, guard_ms=20.0, frac=0.10,min_quiet_ms=3.0,
+                              search_back_ms=120.0, search_fwd_ms=160.0,baseline_ms=80.0, guard_ms=30.0, frac=0.10,min_quiet_ms=3.0,
     ):
     """
     Annotate detected poke peaks with onset/offset and baseline window.
@@ -421,3 +421,94 @@ def extract_sensor_peak_strength_session(poke_windows, fs, t_ref_ms=50.0, pre_ms
     
     all_feats = pd.DataFrame(all_feats)
     return all_feats
+
+
+from scipy.signal import butter, sosfiltfilt
+
+def integrate_poke_window(win, fs, ch, cutoff_hz=60.0, filt_order=4):
+    dt = 1 / fs
+    x = win[ch].to_numpy(dtype=float)   # already baseline-subtracted
+
+    # slow, fast split
+    sos = butter(filt_order, cutoff_hz, btype='low', fs=fs, output='sos')
+    x_slow = sosfiltfilt(sos, x)
+    x_fast = x - x_slow
+
+    Xs = [x, x_slow, x_fast]
+    labels = ["raw", "slow", "fast"]
+
+    # integration
+    out = win.copy()
+
+    for i, X in enumerate(Xs):
+        integrated_X = np.cumsum(X) * dt
+        out[f"{ch}_dFdT_{labels[i]}"] = X
+        out[f"{ch}_F_{labels[i]}"] = integrated_X
+        
+    return out
+
+def integrate_poke_session(pokes, fs, ch="CH5", cutoff_hz=40.0, filt_order=4):
+    out = []
+    for pk in pokes:
+        w_int = integrate_poke_window(
+            pk["window"], fs, ch=ch, cutoff_hz=cutoff_hz, filt_order=filt_order
+        )
+        pk_new = pk.copy()
+        pk_new["force_window"] = w_int
+        out.append(pk_new)
+    return out
+
+def plot_force_windows(
+    pokes,
+    fs,
+    col,
+    n=30,
+    align_to="peak",
+    show_mean=True,
+    title=None,
+):
+    f = plt.figure(figsize=(6,3))
+
+    traces = []
+    time_axes = []
+
+    for i in range(min(n, len(pokes))):
+        pk = pokes[i]
+        fw = pk["force_window"]
+
+        if col not in fw.columns:
+            continue
+
+        y = fw[col].to_numpy(dtype=float)
+
+        if align_to == "peak":
+            ref = pk["peak_idx"] - pk["start_idx"]
+        elif align_to == "onset" and "onset_idx" in pk:
+            ref = pk["onset_idx"] - pk["start_idx"]
+        else:
+            ref = 0
+
+        t = (np.arange(len(y)) - ref) / fs * 1000
+
+        plt.plot(t, y, color="steelblue", alpha=0.18)
+        traces.append(y)
+        time_axes.append(t)
+
+    if show_mean and traces:
+        min_len = min(len(y) for y in traces)
+        Y = np.array([y[:min_len] for y in traces])
+        t_mean = time_axes[0][:min_len]
+        plt.plot(t_mean, Y.mean(axis=0), color="black", linewidth=2)
+
+    if align_to is not None:
+        plt.axvline(0, color="red", linestyle="--")
+
+    plt.xlabel("Time (ms)")
+    plt.ylabel(col)
+
+    if title is None:
+        title = col + (f" aligned to {align_to}" if align_to else "")
+    plt.title(title)
+
+    plt.show()
+    return f
