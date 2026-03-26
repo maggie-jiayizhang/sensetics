@@ -108,7 +108,12 @@ def build_sessions_index(data_dir: str | Path) -> pl.DataFrame:
         # data paths
         timing_csv = meta_dict.get("block_timing_csv")
         timing_csv = meta_path.parent / PureWindowsPath(timing_csv).name if timing_csv else None
-        assert(timing_csv is None or timing_csv.exists()), f"Expected timing CSV not found: {timing_csv}"
+        try:
+            assert(timing_csv is None or timing_csv.exists()), f"Expected timing CSV not found: {timing_csv}"
+        except AssertionError as e:
+            print(f"Error occurred while processing session {session_id}: {e}")
+            continue
+        
         timing_csv = str(timing_csv) if timing_csv is not None else None               
 
         data_csv = meta_path.parent / f"{session_id}.csv"
