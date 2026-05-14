@@ -59,6 +59,26 @@ def poke_detection(pdf, fs, N_cap=None, discard_s=0.1, height=50,
 
     return n_discard, df, mix, candidate_peaks
 
+def remove_partial_peak(poke_windows):
+    n_pokes = len(poke_windows)
+    baselines = np.zeros(n_pokes)
+
+    for i, poke in enumerate(poke_windows):
+        baseline = [poke["baseline"][k] for k in poke["baseline"].keys()]
+        baseline = np.mean(np.array(baseline))
+        baselines[i] = baseline
+
+    mean_baseline = np.mean(baselines)
+    std_baseline = np.std(baselines)
+    threshold_min = 3 * std_baseline # 3 std away from mean
+    
+    invalid_mask = np.abs(baselines - mean_baseline) > threshold_min
+    print(f"Removing {invalid_mask.sum()} out of {n_pokes} poke windows due to partial peaks")
+
+    poke_windows = [p for i, p in enumerate(poke_windows) if not invalid_mask[i]]
+
+    return poke_windows, invalid_mask
+
 def extract_poke_windows(pdf, peaks, fs, pre_ms=10.0, post_ms=10.0):
     """
     Returns a list of dicts, one per poke:
@@ -182,7 +202,7 @@ def annotate_pokes_from_peaks(candidate_peaks, mix, fs,
     return events
 
 def extract_poke_windows_from_annotations(pdf, events, fs, 
-                                          pad_pre_ms=10.0, pad_post_ms=10.0,chs=CHS,baseline_stat="median",
+                                          pad_pre_ms=10.0, pad_post_ms=10.0,chs=CHS, baseline_stat="median",
     ):
     """
     Extract poke windows using annotated events.
@@ -213,11 +233,12 @@ def extract_poke_windows_from_annotations(pdf, events, fs,
         a = max(0, p - pre)
         b = min(len(pdf), p + post)
 
-        win = pdf.iloc[a:b].copy()
-
         # baseline per channel from annotated baseline window
         bs = int(e["baseline_start"])
         be = int(e["baseline_end"])
+
+        a = min(bs, a)
+        win = pdf.iloc[a:b].copy()
 
         base = {}
         for ch in chs:
@@ -422,6 +443,81 @@ def extract_sensor_peak_strength_session(poke_windows, fs, t_ref_ms=50.0, pre_ms
     all_feats = pd.DataFrame(all_feats)
     return all_feats
 
+def extract_sensor_peak_strength_from_annotation(poke_window, fs, ch_list=CHS,
+                                                 pad_pre_peak_ms=10,
+                                                 pad_post_peak_ms=10, 
+                                                 subtract_baseline=True):
+    win = poke_window["window"]
+    try:
+        start_idx = poke_window["start_idx"]
+        b_start, b_end = poke_window["baseline_start"], poke_window["baseline_end"]
+        p_start, p_end = poke_window["onset_idx"], poke_window["offset_idx"]
+
+        # convert to relative index within the window
+        b_start -= start_idx
+        b_end -= start_idx
+        p_start -= start_idx
+        p_end -= start_idx
+
+    except KeyError:
+        print("using the wrong method, must pass annotated poke window with baseline and onset/offset")
+        assert False
+
+    i0 = max(0, p_start - int((pad_pre_peak_ms / 1000.0) * fs))
+    i1 = min(len(win), p_end + int((pad_post_peak_ms / 1000.0) * fs))
+
+    feats = {}
+    pk_list = []
+    for ch in ch_list:
+        x = win[ch].iloc[i0:i1].to_numpy(dtype=float)
+        base = win[ch].iloc[b_start:b_end].to_numpy(dtype=float)
+
+        pk98 = float(np.percentile(x, 98))               # robust peak
+        p2p = robust_p2p(x, lo=1, hi=99)                 # robust peak-to-peak
+        eng = float(np.mean(x*x))                        # mean energy (scale-invariant to window length)
+        pos_area = float(np.mean(np.maximum(0.0, x)))    # mean positive area
+        peak_mean = float(np.mean(x))
+
+        base_pk98 = float(np.percentile(base, 98))
+        base_p2p = robust_p2p(base, lo=1, hi=99)
+        base_mean = float(np.mean(base))
+
+        if (subtract_baseline):
+            pk98 -= base_pk98
+            p2p -= base_p2p
+
+        feats[f"{ch}_pk98"] = pk98
+        feats[f"{ch}_p2p99"] = p2p
+        feats[f"{ch}_eng"] = eng
+        feats[f"{ch}_posmean"] = pos_area
+        
+        sign = -1 if peak_mean < base_mean else 1
+        feats[f"{ch}_pk98_signed"] = sign * pk98
+        feats[f"{ch}_p2p99_signed"] = sign * p2p
+
+        pk_list.append(pk98)
+
+    pk = np.array(pk_list)
+    s = float(pk.sum()) + 1e-12
+    prof = pk / s
+    for i, ch in enumerate(CHS):
+        feats[f"{ch}_pk98_norm"] = float(prof[i])
+    
+    return feats
+
+def extract_sensor_peak_strength_from_annotation_session(poke_windows, fs,
+                                                         ch_list=CHS,    pad_pre_peak_ms=50,
+                                                         pad_post_peak_ms=50,
+                                                         subtract_baseline=True):
+    all_feats = []
+    for poke in poke_windows:
+        feats = extract_sensor_peak_strength_from_annotation(
+            poke, fs, ch_list=ch_list, pad_pre_peak_ms=pad_pre_peak_ms, pad_post_peak_ms=pad_post_peak_ms, subtract_baseline=subtract_baseline
+        )
+        all_feats.append(feats)
+
+    all_feats = pd.DataFrame(all_feats)
+    return all_feats
 
 from scipy.signal import butter, sosfiltfilt
 

@@ -108,12 +108,15 @@ def build_sessions_index(data_dir: str | Path) -> pl.DataFrame:
         # data paths
         timing_csv = meta_dict.get("block_timing_csv")
         timing_csv = meta_path.parent / PureWindowsPath(timing_csv).name if timing_csv else None
+        fs_hz_channel = None
         try:
             assert(timing_csv is None or timing_csv.exists()), f"Expected timing CSV not found: {timing_csv}"
         except AssertionError as e:
-            print(f"Error occurred while processing session {session_id}: {e}")
-            continue
-        
+            filtering = meta_dict.get("filtering")
+            if filtering:
+                fs_hz_channel = filtering.get("per_channel_sample_rates_hz")
+            timing_csv = None
+                
         timing_csv = str(timing_csv) if timing_csv is not None else None               
 
         data_csv = meta_path.parent / f"{session_id}.csv"
@@ -121,13 +124,16 @@ def build_sessions_index(data_dir: str | Path) -> pl.DataFrame:
 
         # sampling rate
         fs_hz = (meta_dict.get("timing") or {}).get("per_channel_rate_hz")
-        if (timing_csv and sweeps_per_block == 1):
+        if (timing_csv is not None and sweeps_per_block == 1):
             timing_csv_df = pd.read_csv(timing_csv, index_col=0)
             gaps = np.diff(timing_csv_df["block_end_us"].to_numpy())
             fs_hz, median_gap = get_approx_sampling_rate(gaps, truncate=5)
             # drop out ratio
             drop_out, ratio = get_dropout_idx(gaps, median_gap, threshold_r=1.8)
             assert(ratio < 0.01), f"High dropout ratio {ratio} in session {session_id}"
+
+        elif fs_hz_channel is not None:
+            fs_hz = fs_hz_channel.get("1")  # assuming all channels have same rate
 
         fd = meta_dict.get("force_data") or {}
         force_available = fd.get("available")
